@@ -14,3 +14,13 @@ from django.core.wsgi import get_wsgi_application
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'betterfind_django.settings')
 
 application = get_wsgi_application()
+
+# Run migrations automatically on startup
+try:
+    from django.core.management import call_command
+    print("🚀 Running migrations on startup...")
+    call_command('migrate', interactive=False)
+    print("✅ Migrations completed successfully!")
+except Exception as e:
+    print(f"❌ Error running migrations on startup: {e}")
+
