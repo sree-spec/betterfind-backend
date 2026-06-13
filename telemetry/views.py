@@ -26,18 +26,29 @@ class LinkDeviceView(APIView):
                 device_id=device_id,
                 defaults={
                     'owner': request.user,
-                    'nickname': nickname,
+                    'nickname': nickname or f'Device ({device_id})',
                     'model_name': model_name
                 }
             )
 
-            if not created and device.owner != request.user:
-                # User is NOT the owner — add them as a watcher instead of stealing ownership.
-                # This is the "Track Someone Else" flow: the other person already registered this device.
+            if not created:
+                if device.owner == request.user:
+                    # Re-linking own device — just confirm
+                    return Response({"message": "Device linked successfully", "device": DeviceSerializer(device).data}, status=status.HTTP_200_OK)
+
+                # Check if this device is owned by the system sentinel (auto-registered, unclaimed)
+                if device.owner.email == 'system@betterfind.internal':
+                    # Claim it: transfer real ownership to this user
+                    device.owner = request.user
+                    device.nickname = nickname or f'Device ({device_id})'
+                    device.save()
+                    return Response({"message": "Device claimed successfully", "device": DeviceSerializer(device).data}, status=status.HTTP_200_OK)
+
+                # Device is owned by someone else — add caller as a watcher
                 device.watched_by.add(request.user)
                 return Response({"message": "Now watching device", "device": DeviceSerializer(device).data}, status=status.HTTP_200_OK)
 
-            # User IS the owner (either just created, or re-linking their own device)
+            # Newly created — this user is the owner
             return Response({"message": "Device linked successfully", "device": DeviceSerializer(device).data}, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -57,7 +68,30 @@ class TrackDataView(APIView):
 
         device = Device.objects.filter(device_id=device_id).first()
         if not device:
-            return Response({"error": "Device not registered"}, status=status.HTTP_404_NOT_FOUND)
+            # Auto-register the device on first telemetry contact.
+            # This handles the case where the friend's phone never successfully
+            # called /api/device/link/ (e.g. was offline at the time).
+            # We create a bare device record; the owner will be claimed via
+            # /api/device/link/ when the watcher or the device owner enters the code.
+            # Use a sentinel system user (or None owner trick via nullable FK).
+            # Since owner is non-nullable, we use get_or_create on a system user.
+            from django.contrib.auth import get_user_model
+            UserModel = get_user_model()
+            system_user, _ = UserModel.objects.get_or_create(
+                email='system@betterfind.internal',
+                defaults={
+                    'username': 'system_betterfind',
+                    'is_active': False,
+                    'role': UserModel.Role.ADMIN,
+                }
+            )
+            device = Device.objects.create(
+                device_id=device_id,
+                owner=system_user,
+                nickname=f'Auto-registered ({device_id})',
+                model_name=device_info.get('model', ''),
+            )
+            print(f'📱 Auto-registered new device: {device_id}')
 
         # Automatically update device's model_name from telemetry info to avoid DB migrations
         mfr = device_info.get('manufacturer')
