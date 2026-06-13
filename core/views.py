@@ -82,27 +82,4 @@ class HealthView(APIView):
     def get(self, request):
         return Response({"status": "ok"}, status=status.HTTP_200_OK)
 
-class DbDebugView(APIView):
-    permission_classes = [AllowAny]
-    def get(self, request):
-        from django.db import connection
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
-                tables = [row[0] for row in cursor.fetchall()]
-                
-                schemas = {}
-                for table in tables:
-                    cursor.execute(f"""
-                        SELECT column_name, data_type 
-                        FROM information_schema.columns 
-                        WHERE table_name = '{table}'
-                    """)
-                    schemas[table] = {row[0]: row[1] for row in cursor.fetchall()}
-                
-                return Response({
-                    "tables": tables,
-                    "schemas": schemas
-                }, status=status.HTTP_200_OK)
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+

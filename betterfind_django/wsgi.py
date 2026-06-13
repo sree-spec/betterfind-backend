@@ -17,16 +17,6 @@ application = get_wsgi_application()
 
 # Run migrations automatically on startup
 try:
-    from django.db import connection
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
-        tables = [row[0] for row in cursor.fetchall()]
-        if tables:
-            print(f"🔥 Resetting database tables: {tables}")
-            for table in tables:
-                cursor.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
-            print("✅ Database reset complete.")
-
     from django.core.management import call_command
     print("🚀 Running migrations on startup...")
     call_command('migrate', interactive=False)
