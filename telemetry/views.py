@@ -16,9 +16,6 @@ class LinkDeviceView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        if request.user.role != User.Role.OWNER:
-            return Response({"error": "Only owners can link devices"}, status=status.HTTP_403_FORBIDDEN)
-            
         serializer = LinkDeviceSerializer(data=request.data)
         if serializer.is_valid():
             device_id = serializer.validated_data['device_id']
@@ -33,12 +30,14 @@ class LinkDeviceView(APIView):
                     'model_name': model_name
                 }
             )
-            
+
             if not created and device.owner != request.user:
-                # Re-assign device to the new owner (for testing/claiming purposes)
-                device.owner = request.user
-                device.save()
-                
+                # User is NOT the owner — add them as a watcher instead of stealing ownership.
+                # This is the "Track Someone Else" flow: the other person already registered this device.
+                device.watched_by.add(request.user)
+                return Response({"message": "Now watching device", "device": DeviceSerializer(device).data}, status=status.HTTP_200_OK)
+
+            # User IS the owner (either just created, or re-linking their own device)
             return Response({"message": "Device linked successfully", "device": DeviceSerializer(device).data}, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -415,12 +414,13 @@ class LatestDataView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, device_id):
-        # Verification of access
+        # Verify access: user must be the owner OR an authorized watcher
         try:
             device = Device.objects.get(device_id=device_id)
-            if request.user.role == User.Role.OWNER and device.owner != request.user:
-                return Response(status=status.HTTP_403_FORBIDDEN)
-            # Guardian logic would go here if GuardianProfile links to devices
+            is_owner = device.owner == request.user
+            is_watcher = device.watched_by.filter(pk=request.user.pk).exists()
+            if not is_owner and not is_watcher:
+                return Response({"error": "Access denied. Enter the device code first to start watching."}, status=status.HTTP_403_FORBIDDEN)
         except Device.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
@@ -442,33 +442,29 @@ class LatestDataView(APIView):
         if recent_shutdown and (timezone.now() - recent_shutdown.timestamp).total_seconds() < 120:
              force_offline = True
 
-        # Tracking Source Priority Logic
+        # Tracking Source Priority Logic — allow up to 5 minutes before going OFFLINE
         latest_gps = device.gps_locations.order_by('-timestamp').first()
-        # Mock logic for Cell/WiFi estimates (In a real scenario, you'd do external API lookups)
         latest_cell = device.cell_towers.order_by('-timestamp').first()
         
         location_data = None
         source = 'OFFLINE'
         
-        if latest_gps and (timezone.now() - latest_gps.timestamp).total_seconds() < 120: # recent GPS within 2 mins
+        if latest_gps and (timezone.now() - latest_gps.timestamp).total_seconds() < 300:  # 5 min
             location_data = {"lat": latest_gps.latitude, "lng": latest_gps.longitude, "accuracy": latest_gps.accuracy}
             source = 'GPS'
-        elif latest_cell and latest_cell.estimated_latitude and (timezone.now() - latest_cell.timestamp).total_seconds() < 120:
+        elif latest_cell and latest_cell.estimated_latitude and (timezone.now() - latest_cell.timestamp).total_seconds() < 300:
             location_data = {"lat": latest_cell.estimated_latitude, "lng": latest_cell.estimated_longitude, "accuracy": 1000}
             source = 'CELL_TOWER'
 
+        # Always return last known battery (don't discard based on age)
         battery = device.battery_logs.order_by('-timestamp').first()
-        if battery and (timezone.now() - battery.timestamp).total_seconds() > 120:
-            battery = None
 
+        # Always return last known SIM (don't discard based on age)
         sim = device.sim_logs.order_by('-timestamp').first()
-        if sim and (timezone.now() - sim.timestamp).total_seconds() > 120:
-            sim = None
             
         if force_offline:
             location_data = None
             source = 'OFFLINE'
-            battery = None
 
         alerts = device.security_alerts.filter(is_resolved=False).order_by('-created_at')[:5]
 
@@ -496,12 +492,23 @@ class LatestDataView(APIView):
                  "risk_score": min(risk_score, 100)
              }
 
+        # Parse device_info from model_name field (stored as "manufacturer|model|os_version")
+        device_info = {}
+        if device.model_name:
+            parts = device.model_name.split('|')
+            device_info = {
+                "manufacturer": parts[0].strip() if len(parts) > 0 and parts[0].strip() else "—",
+                "model": parts[1].strip() if len(parts) > 1 and parts[1].strip() else "—",
+                "android_version": parts[2].strip() if len(parts) > 2 and parts[2].strip() else "—",
+            }
+
         return Response({
             "device": DeviceSerializer(device).data,
             "source": source,
             "location": location_data,
             "battery": {"level": battery.level, "is_charging": battery.is_charging} if battery else None,
             "sim": sim_data,
+            "device_info": device_info,
             "alerts": SecurityAlertSerializer(alerts, many=True).data
         })
 
@@ -509,11 +516,11 @@ class DeviceListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if request.user.role == User.Role.OWNER:
-            devices = Device.objects.filter(owner=request.user)
-        else:
-            return Response({"error": "Only owners can view devices currently"}, status=status.HTTP_403_FORBIDDEN)
-        
+        # Return devices the user owns OR is watching
+        owned = Device.objects.filter(owner=request.user)
+        watching = request.user.watched_devices.all()
+        # Combine and deduplicate using union
+        devices = (owned | watching).distinct()
         return Response([DeviceSerializer(device).data for device in devices])
 
 class GeoFenceListCreateView(APIView):
@@ -522,13 +529,10 @@ class GeoFenceListCreateView(APIView):
     def _get_device(self, request, device_id):
         try:
             device = Device.objects.get(device_id=device_id)
-            # Both Owners and Guardians can manage geofences for a linked device
-            if request.user.role == User.Role.OWNER and device.owner != request.user:
-                # Check if this owner actually owns the device
+            is_owner = device.owner == request.user
+            is_watcher = device.watched_by.filter(pk=request.user.pk).exists()
+            if not is_owner and not is_watcher:
                 return None
-            elif request.user.role == User.Role.GUARDIAN:
-                # In a full system we'd check if the guardian is linked to this owner
-                pass
             return device
         except Device.DoesNotExist:
             return None
@@ -564,7 +568,9 @@ class GeoFenceDetailView(APIView):
     def _get_device(self, request, device_id):
         try:
             device = Device.objects.get(device_id=device_id)
-            if request.user.role == User.Role.OWNER and device.owner != request.user:
+            is_owner = device.owner == request.user
+            is_watcher = device.watched_by.filter(pk=request.user.pk).exists()
+            if not is_owner and not is_watcher:
                 return None
             return device
         except Device.DoesNotExist:
@@ -588,7 +594,9 @@ class DeviceHistoryView(APIView):
     def _get_device(self, request, device_id):
         try:
             device = Device.objects.get(device_id=device_id)
-            if request.user.role == User.Role.OWNER and device.owner != request.user:
+            is_owner = device.owner == request.user
+            is_watcher = device.watched_by.filter(pk=request.user.pk).exists()
+            if not is_owner and not is_watcher:
                 return None
             return device
         except Device.DoesNotExist:
@@ -697,7 +705,9 @@ class GeoFenceLogListView(APIView):
     def _get_device(self, request, device_id):
         try:
             device = Device.objects.get(device_id=device_id)
-            if request.user.role == User.Role.OWNER and device.owner != request.user:
+            is_owner = device.owner == request.user
+            is_watcher = device.watched_by.filter(pk=request.user.pk).exists()
+            if not is_owner and not is_watcher:
                 return None
             return device
         except Device.DoesNotExist:

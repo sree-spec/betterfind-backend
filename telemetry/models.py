@@ -14,6 +14,13 @@ class Device(models.Model):
     primary_operator_code = models.CharField(max_length=50, null=True, blank=True)
     primary_mcc = models.IntegerField(null=True, blank=True)
     primary_mnc = models.IntegerField(null=True, blank=True)
+    # Users who are watching this device (but don't own it)
+    watched_by = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name='watched_devices',
+        blank=True,
+        help_text="Users granted read-only tracking access via 6-digit code"
+    )
 
     def __str__(self):
         return f"{self.nickname or self.model_name or self.device_id} ({self.owner.email})"
